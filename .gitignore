@@ -1,0 +1,29 @@
+.DS_Store
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+*.py[cod]
+*.egg-info/
+*.log
+.coverage
+htmlcov/
+
+# Environments
+.env
+.env.*
+.venv/
+venv/
+
+# Editors/IDE
+.vscode/
+.idea/
+
+# Build/artifacts
+dist/
+build/
+.eggs/
+
+# Project data
+.vector-index/
