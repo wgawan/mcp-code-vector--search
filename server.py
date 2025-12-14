@@ -584,9 +584,8 @@ async def list_tools() -> List[Tool]:
     return [
         Tool(
             name="semantic_search",
-            description="Search codebase semantically using natural language. "
-                       "Finds relevant code chunks even without exact keyword matches. "
-                       "Respects .gitignore rules. Use this to find code by concept or functionality.",
+            description="Use first to locate where a feature is implemented, find the right file/module, discover existing helpers, confirm naming conventions, or surface similar patterns before editing. "
+                       "Semantic search over the codebase that works even without exact keywords and respects .gitignore rules.",
             inputSchema={
                 "type": "object",
                 "properties": {
