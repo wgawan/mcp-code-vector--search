@@ -14,6 +14,16 @@ import signal
 import threading
 from contextlib import contextmanager
 
+def _read_positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
 # Intel OpenVINO acceleration support
 class OpenVINOEmbeddingFunction:
     """Custom embedding function that uses Intel OpenVINO for acceleration.
@@ -22,10 +32,11 @@ class OpenVINOEmbeddingFunction:
     and Intel integrated GPUs through hardware-specific optimizations.
     """
 
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
+    def __init__(self, model_name: str = "all-MiniLM-L6-v2", batch_size: int = 32):
         self.model = None
         self._model_name = model_name
         self.backend = "pytorch"  # default fallback
+        self.batch_size = max(1, int(batch_size))
 
         # Try to use OpenVINO backend for sentence-transformers
         try:
@@ -62,7 +73,11 @@ class OpenVINOEmbeddingFunction:
             print(f"Warning: __call__ received empty input", file=sys.stderr)
             return [[]]
         try:
-            embeddings = self.model.encode(input, convert_to_numpy=True)
+            embeddings = self.model.encode(
+                input,
+                convert_to_numpy=True,
+                batch_size=self.batch_size
+            )
             result = embeddings.tolist()
             # Ensure we always return List[List[float]]
             if result and not isinstance(result[0], list):
@@ -87,7 +102,11 @@ class OpenVINOEmbeddingFunction:
             q = q[0] if q else ""
         if not q:
             return [[]]
-        embeddings = self.model.encode(q, convert_to_numpy=True)
+        embeddings = self.model.encode(
+            q,
+            convert_to_numpy=True,
+            batch_size=self.batch_size
+        )
         # Return as List[List[float]] - wrap single embedding in a list
         return [embeddings.tolist()]
 
@@ -187,6 +206,10 @@ class CodeVectorStore:
     def __init__(self, project_root: str, persist_directory: Optional[str] = None):
         self.project_root = project_root
         self.gitignore_parser = GitignoreParser(project_root)
+        self.chunk_size = _read_positive_int_env("CHUNK_SIZE", 800)
+        self.index_batch_size = _read_positive_int_env("INDEX_BATCH_CHUNKS", 512)
+        self.embedding_batch_size = _read_positive_int_env("EMBED_BATCH_SIZE", 64)
+        self.embedding_model_name = os.environ.get("EMBED_MODEL_NAME", "all-MiniLM-L6-v2")
         self.always_ignore_dirs = {'.git', '__pycache__', '.pytest_cache',
                                    '.mypy_cache', '.tox', 'venv', '.venv',
                                    'node_modules', '.next', 'dist', 'build',
@@ -209,7 +232,22 @@ class CodeVectorStore:
         
         # Use sentence transformers for embeddings with Intel OpenVINO acceleration
         self.embedding_function = OpenVINOEmbeddingFunction(
-            model_name="all-MiniLM-L6-v2"
+            model_name=self.embedding_model_name,
+            batch_size=self.embedding_batch_size
+        )
+        print(
+            f"Index settings: CHUNK_SIZE={self.chunk_size}, "
+            f"INDEX_BATCH_CHUNKS={self.index_batch_size}, "
+            f"EMBED_BATCH_SIZE={self.embedding_batch_size}, "
+            f"BACKEND={self.embedding_function.backend}, "
+            f"MODEL={self.embedding_function._model_name}",
+            file=sys.stderr
+        )
+        print(
+            "Model options: all-MiniLM-L12-v2 (higher quality, slower), "
+            "multi-qa-MiniLM-L6-cos-v1 (QA-style queries), "
+            "bge-small-en-v1.5 (faster, smaller).",
+            file=sys.stderr
         )
         
         # Create collection name based on project root hash
@@ -300,6 +338,21 @@ class CodeVectorStore:
                 current_size = 0
         
         return chunks
+
+    def _add_batch(self, ids: List[str], documents: List[str], metadatas: List[Dict]):
+        if not ids:
+            return
+        print(f"  Adding {len(ids)} chunks...", file=sys.stderr, end='', flush=True)
+        with self._collection_lock:
+            self.collection.add(
+                ids=ids,
+                documents=documents,
+                metadatas=metadatas
+            )
+        print(f" done", file=sys.stderr, flush=True)
+        ids.clear()
+        documents.clear()
+        metadatas.clear()
     
     def index_file(self, filepath: str):
         """Index a single file using Chroma"""
@@ -309,6 +362,14 @@ class CodeVectorStore:
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
+
+            try:
+                file_stat = os.stat(filepath)
+                file_mtime = int(file_stat.st_mtime)
+                file_size = file_stat.st_size
+            except OSError:
+                file_mtime = None
+                file_size = None
 
             content_hash = self._compute_hash(content)
 
@@ -330,7 +391,7 @@ class CodeVectorStore:
             self.remove_file(filepath)
 
             # Create chunks (no lock needed - pure computation)
-            chunks = self._chunk_file(content, filepath)
+            chunks = self._chunk_file(content, filepath, chunk_size=self.chunk_size)
 
             if not chunks:
                 return
@@ -344,6 +405,8 @@ class CodeVectorStore:
                     'start_line': chunk['start_line'],
                     'end_line': chunk['end_line'],
                     'content_hash': content_hash,
+                    'file_mtime': file_mtime,
+                    'file_size': file_size,
                     'chunk_index': i
                 }
                 for i, chunk in enumerate(chunks)
@@ -382,8 +445,11 @@ class CodeVectorStore:
         except Exception as e:
             pass
     
-    def index_directory(self, directory: str):
+    def index_directory(self, directory: str, *, fresh_index: bool = False):
         """Index entire directory"""
+        if fresh_index:
+            return self._index_directory_fresh(directory)
+
         print(f"\n📁 Indexing directory: {directory}", file=sys.stderr)
         indexed_count = 0
         skipped_count = 0
@@ -400,6 +466,67 @@ class CodeVectorStore:
                 else:
                     skipped_count += 1
         
+        print(f"\n✅ Indexing complete!", file=sys.stderr)
+        print(f"   Indexed: {indexed_count} files", file=sys.stderr)
+        print(f"   Skipped: {skipped_count} files", file=sys.stderr)
+        with self._collection_lock:
+            print(f"   Total chunks: {self.collection.count()}\n", file=sys.stderr)
+
+    def _index_directory_fresh(self, directory: str):
+        print(f"\n📁 Indexing directory: {directory}", file=sys.stderr)
+        print(f"   Fast path enabled (chunk size: {self.chunk_size}, batch: {self.index_batch_size})", file=sys.stderr)
+        indexed_count = 0
+        skipped_count = 0
+        batch_ids: List[str] = []
+        batch_docs: List[str] = []
+        batch_metas: List[Dict] = []
+
+        for root, dirs, files in os.walk(directory):
+            dirs[:] = [d for d in dirs if not self.gitignore_parser.should_ignore(os.path.join(root, d))
+                      and d not in self.always_ignore_dirs]
+
+            for file in files:
+                filepath = os.path.join(root, file)
+                if not self._should_index_file(filepath):
+                    skipped_count += 1
+                    continue
+
+                try:
+                    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                    file_stat = os.stat(filepath)
+                    file_mtime = int(file_stat.st_mtime)
+                    file_size = file_stat.st_size
+                except Exception:
+                    skipped_count += 1
+                    continue
+
+                content_hash = self._compute_hash(content)
+                chunks = self._chunk_file(content, filepath, chunk_size=self.chunk_size)
+                if not chunks:
+                    skipped_count += 1
+                    continue
+
+                for i, chunk in enumerate(chunks):
+                    batch_ids.append(f"{filepath}::{i}")
+                    batch_docs.append(chunk['text'])
+                    batch_metas.append({
+                        'filepath': chunk['filepath'],
+                        'start_line': chunk['start_line'],
+                        'end_line': chunk['end_line'],
+                        'content_hash': content_hash,
+                        'file_mtime': file_mtime,
+                        'file_size': file_size,
+                        'chunk_index': i
+                    })
+
+                indexed_count += 1
+                if len(batch_ids) >= self.index_batch_size:
+                    self._add_batch(batch_ids, batch_docs, batch_metas)
+                print(f"✓ Indexed: {filepath} ({len(chunks)} chunks)", file=sys.stderr, flush=True)
+
+        self._add_batch(batch_ids, batch_docs, batch_metas)
+
         print(f"\n✅ Indexing complete!", file=sys.stderr)
         print(f"   Indexed: {indexed_count} files", file=sys.stderr)
         print(f"   Skipped: {skipped_count} files", file=sys.stderr)
@@ -485,11 +612,15 @@ class CodeVectorStore:
         # Get all indexed files and their hashes (lock for collection access)
         with self._collection_lock:
             all_items = self.collection.get(include=["metadatas"])
-        indexed_files = {}  # filepath -> content_hash
+        indexed_files: Dict[str, Dict[str, Any]] = {}  # filepath -> metadata
         for metadata in all_items['metadatas']:
             filepath = metadata['filepath']
-            content_hash = metadata.get('content_hash', '')
-            indexed_files[filepath] = content_hash
+            if filepath not in indexed_files:
+                indexed_files[filepath] = {
+                    'content_hash': metadata.get('content_hash', ''),
+                    'file_mtime': metadata.get('file_mtime'),
+                    'file_size': metadata.get('file_size'),
+                }
 
         # First pass: collect changes needed
         files_to_add = []  # (filepath,)
@@ -506,6 +637,28 @@ class CodeVectorStore:
                 if not self._should_index_file(filepath):
                     continue
 
+                if filepath not in indexed_files:
+                    files_to_add.append(filepath)
+                    continue
+
+                existing_indexed_files.add(filepath)
+                entry = indexed_files[filepath]
+
+                try:
+                    file_stat = os.stat(filepath)
+                    current_mtime = int(file_stat.st_mtime)
+                    current_size = file_stat.st_size
+                except OSError:
+                    continue
+
+                stored_mtime = entry.get('file_mtime')
+                stored_size = entry.get('file_size')
+                stored_hash = entry.get('content_hash')
+
+                if stored_mtime is not None and stored_size is not None:
+                    if stored_mtime == current_mtime and stored_size == current_size:
+                        continue
+
                 try:
                     with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                         content = f.read()
@@ -513,12 +666,8 @@ class CodeVectorStore:
                 except Exception:
                     continue
 
-                if filepath in indexed_files:
-                    existing_indexed_files.add(filepath)
-                    if indexed_files[filepath] != current_hash:
-                        files_to_update.append(filepath)
-                else:
-                    files_to_add.append(filepath)
+                if stored_hash != current_hash:
+                    files_to_update.append(filepath)
 
         # Find deleted files
         for filepath in indexed_files:
@@ -534,7 +683,7 @@ class CodeVectorStore:
             if change_ratio > 0.2 or total_changes > 100:
                 print(f"   Many changes detected ({total_changes}), doing clean reset...", file=sys.stderr)
                 self.reset_collection()
-                self.index_directory(directory)
+                self.index_directory(directory, fresh_index=True)
                 stats['reset'] = True
                 stats['added'] = len(files_to_add) + len(indexed_files) - len(files_to_remove)
                 stats['updated'] = len(files_to_update)
@@ -692,7 +841,7 @@ async def call_tool(name: str, arguments: Any) -> List[TextContent]:
             # Reset collection to reclaim disk space (HNSW is append-only)
             vector_store.reset_collection()
 
-            vector_store.index_directory(project_root)
+            vector_store.index_directory(project_root, fresh_index=True)
 
             return [TextContent(
                 type="text",
@@ -768,10 +917,10 @@ async def main():
     if force_reindex:
         print(f"🔄 FORCE_REINDEX=true, performing clean reindex...", file=sys.stderr)
         vector_store.reset_collection()
-        vector_store.index_directory(project_root)
+        vector_store.index_directory(project_root, fresh_index=True)
     elif chunk_count == 0:
         # Fresh index
-        vector_store.index_directory(project_root)
+        vector_store.index_directory(project_root, fresh_index=True)
     else:
         # Check for index bloat (HNSW append-only issue)
         persist_size_mb = vector_store.get_persist_dir_size_mb(persist_dir)
@@ -787,7 +936,7 @@ async def main():
             print(f"⚠️  Index bloat detected ({bloat_ratio:.1f}x expected size)!", file=sys.stderr)
             print(f"   Performing clean reindex to reclaim space...", file=sys.stderr)
             vector_store.reset_collection()
-            vector_store.index_directory(project_root)
+            vector_store.index_directory(project_root, fresh_index=True)
         else:
             # Sync with filesystem to catch changes without bloating
             print(f"🔄 Syncing index with filesystem...", file=sys.stderr)
