@@ -11,6 +11,7 @@ import fnmatch
 import hashlib
 import sys
 import signal
+import threading
 from contextlib import contextmanager
 
 # Intel OpenVINO acceleration support
@@ -186,11 +187,14 @@ class CodeVectorStore:
     def __init__(self, project_root: str, persist_directory: Optional[str] = None):
         self.project_root = project_root
         self.gitignore_parser = GitignoreParser(project_root)
-        self.always_ignore_dirs = {'.git', '__pycache__', '.pytest_cache', 
+        self.always_ignore_dirs = {'.git', '__pycache__', '.pytest_cache',
                                    '.mypy_cache', '.tox', 'venv', '.venv',
                                    'node_modules', '.next', 'dist', 'build',
                                    'target', '.gradle', '.idea', '.vscode'}
-        
+
+        # Lock to prevent race conditions between file watcher and reset operations
+        self._collection_lock = threading.RLock()
+
         # Initialize Chroma client
         if persist_directory:
             print(f"Using persistent storage at: {persist_directory}", file=sys.stderr)
@@ -226,19 +230,20 @@ class CodeVectorStore:
         Chroma's HNSW index uses append-only storage - deletions mark records
         as deleted but don't reclaim space. This method forces fresh files.
         """
-        collection_name = self.collection.name
-        print(f"🔄 Resetting collection {collection_name} to reclaim disk space...", file=sys.stderr)
+        with self._collection_lock:
+            collection_name = self.collection.name
+            print(f"🔄 Resetting collection {collection_name} to reclaim disk space...", file=sys.stderr)
 
-        # Delete the collection entirely (removes HNSW files)
-        self.client.delete_collection(name=collection_name)
+            # Delete the collection entirely (removes HNSW files)
+            self.client.delete_collection(name=collection_name)
 
-        # Recreate with same settings
-        self.collection = self.client.create_collection(
-            name=collection_name,
-            embedding_function=self.embedding_function,
-            metadata={"hnsw:space": "cosine"}
-        )
-        print(f"✓ Collection reset complete", file=sys.stderr)
+            # Recreate with same settings
+            self.collection = self.client.create_collection(
+                name=collection_name,
+                embedding_function=self.embedding_function,
+                metadata={"hnsw:space": "cosine"}
+            )
+            print(f"✓ Collection reset complete", file=sys.stderr)
 
     def _compute_hash(self, content: str) -> str:
         return hashlib.md5(content.encode()).hexdigest()
@@ -300,36 +305,37 @@ class CodeVectorStore:
         """Index a single file using Chroma"""
         if not self._should_index_file(filepath):
             return
-        
+
         try:
             with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
                 content = f.read()
-            
+
             content_hash = self._compute_hash(content)
-            
-            # Check if file already indexed with same hash
-            try:
-                existing = self.collection.get(
-                    where={"filepath": filepath},
-                    include=["metadatas"]
-                )
-                
-                if existing['ids'] and existing['metadatas']:
-                    if existing['metadatas'][0].get('content_hash') == content_hash:
-                        return  # No changes
-            except:
-                pass
-            
-            # Remove old chunks for this file
+
+            # Check if file already indexed with same hash (lock for collection access)
+            with self._collection_lock:
+                try:
+                    existing = self.collection.get(
+                        where={"filepath": filepath},
+                        include=["metadatas"]
+                    )
+
+                    if existing['ids'] and existing['metadatas']:
+                        if existing['metadatas'][0].get('content_hash') == content_hash:
+                            return  # No changes
+                except:
+                    pass
+
+            # Remove old chunks for this file (has its own locking)
             self.remove_file(filepath)
-            
-            # Create chunks
+
+            # Create chunks (no lock needed - pure computation)
             chunks = self._chunk_file(content, filepath)
-            
+
             if not chunks:
                 return
-            
-            # Prepare data for Chroma
+
+            # Prepare data for Chroma (no lock needed - pure computation)
             ids = [f"{filepath}::{i}" for i in range(len(chunks))]
             documents = [chunk['text'] for chunk in chunks]
             metadatas = [
@@ -342,35 +348,37 @@ class CodeVectorStore:
                 }
                 for i, chunk in enumerate(chunks)
             ]
-            
-            # Add to Chroma
+
+            # Add to Chroma (lock for collection access)
             print(f"  Adding {len(chunks)} chunks...", file=sys.stderr, end='', flush=True)
             sys.stderr.flush()
 
-            self.collection.add(
-                ids=ids,
-                documents=documents,
-                metadatas=metadatas
-            )
+            with self._collection_lock:
+                self.collection.add(
+                    ids=ids,
+                    documents=documents,
+                    metadatas=metadatas
+                )
 
             print(f" done", file=sys.stderr, flush=True)
             sys.stderr.flush()
             print(f"✓ Indexed: {filepath} ({len(chunks)} chunks)", file=sys.stderr, flush=True)
-            
+
         except Exception as e:
             print(f"✗ Error indexing {filepath}: {e}", file=sys.stderr)
     
     def remove_file(self, filepath: str):
         """Remove file from index"""
         try:
-            results = self.collection.get(
-                where={"filepath": filepath},
-                include=[]
-            )
-            
-            if results['ids']:
-                self.collection.delete(ids=results['ids'])
-                print(f"✓ Removed: {filepath} ({len(results['ids'])} chunks)", file=sys.stderr)
+            with self._collection_lock:
+                results = self.collection.get(
+                    where={"filepath": filepath},
+                    include=[]
+                )
+
+                if results['ids']:
+                    self.collection.delete(ids=results['ids'])
+                    print(f"✓ Removed: {filepath} ({len(results['ids'])} chunks)", file=sys.stderr)
         except Exception as e:
             pass
     
@@ -395,56 +403,59 @@ class CodeVectorStore:
         print(f"\n✅ Indexing complete!", file=sys.stderr)
         print(f"   Indexed: {indexed_count} files", file=sys.stderr)
         print(f"   Skipped: {skipped_count} files", file=sys.stderr)
-        print(f"   Total chunks: {self.collection.count()}\n", file=sys.stderr)
+        with self._collection_lock:
+            print(f"   Total chunks: {self.collection.count()}\n", file=sys.stderr)
     
     def search(self, query: str, top_k: int = 5, filter_filepath: Optional[str] = None) -> List[Dict]:
         """Search for relevant code chunks"""
-        if self.collection.count() == 0:
-            return []
+        with self._collection_lock:
+            if self.collection.count() == 0:
+                return []
 
-        where_filter = None
-        if filter_filepath:
-            where_filter = {"filepath": {"$eq": filter_filepath}}
+            where_filter = None
+            if filter_filepath:
+                where_filter = {"filepath": {"$eq": filter_filepath}}
 
-        try:
-            results = self.collection.query(
-                query_texts=[query],
-                n_results=min(top_k, self.collection.count()),
-                where=where_filter,
-                include=["documents", "metadatas", "distances"]
-            )
-        except Exception as e:
-            print(f"Search error: {e}", file=sys.stderr)
-            raise
+            try:
+                results = self.collection.query(
+                    query_texts=[query],
+                    n_results=min(top_k, self.collection.count()),
+                    where=where_filter,
+                    include=["documents", "metadatas", "distances"]
+                )
+            except Exception as e:
+                print(f"Search error: {e}", file=sys.stderr)
+                raise
 
-        if not results['ids'] or not results['ids'][0]:
-            return []
-        
-        formatted_results = []
-        for i in range(len(results['ids'][0])):
-            formatted_results.append({
-                'text': results['documents'][0][i],
-                'filepath': results['metadatas'][0][i]['filepath'],
-                'start_line': results['metadatas'][0][i]['start_line'],
-                'end_line': results['metadatas'][0][i]['end_line'],
-                'score': results['distances'][0][i]
-            })
-        
-        return formatted_results
+            if not results['ids'] or not results['ids'][0]:
+                return []
+
+            formatted_results = []
+            for i in range(len(results['ids'][0])):
+                formatted_results.append({
+                    'text': results['documents'][0][i],
+                    'filepath': results['metadatas'][0][i]['filepath'],
+                    'start_line': results['metadatas'][0][i]['start_line'],
+                    'end_line': results['metadatas'][0][i]['end_line'],
+                    'score': results['distances'][0][i]
+                })
+
+            return formatted_results
     
     def get_stats(self) -> Dict:
         """Get statistics about indexed code"""
-        all_items = self.collection.get(include=["metadatas"])
+        with self._collection_lock:
+            all_items = self.collection.get(include=["metadatas"])
 
-        files = set()
-        for metadata in all_items['metadatas']:
-            files.add(metadata['filepath'])
+            files = set()
+            for metadata in all_items['metadatas']:
+                files.add(metadata['filepath'])
 
-        return {
-            'total_chunks': self.collection.count(),
-            'total_files': len(files),
-            'unique_files': sorted(list(files))
-        }
+            return {
+                'total_chunks': self.collection.count(),
+                'total_files': len(files),
+                'unique_files': sorted(list(files))
+            }
 
     def get_persist_dir_size_mb(self, persist_dir: str) -> float:
         """Get total size of persistence directory in MB"""
@@ -471,8 +482,9 @@ class CodeVectorStore:
         """
         stats = {'removed': 0, 'updated': 0, 'added': 0, 'unchanged': 0, 'reset': False}
 
-        # Get all indexed files and their hashes
-        all_items = self.collection.get(include=["metadatas"])
+        # Get all indexed files and their hashes (lock for collection access)
+        with self._collection_lock:
+            all_items = self.collection.get(include=["metadatas"])
         indexed_files = {}  # filepath -> content_hash
         for metadata in all_items['metadatas']:
             filepath = metadata['filepath']
@@ -584,7 +596,7 @@ async def list_tools() -> List[Tool]:
     return [
         Tool(
             name="semantic_search",
-            description="Use first to locate where a feature is implemented, find the right file/module, discover existing helpers, confirm naming conventions, or surface similar patterns before editing. "
+            description="Fast semantic code search. Use this first to locate relevant files or modules before listing directories or grepping. Ideal for understanding where a feature lives; follow up with file inspection after finding hits"
                        "Semantic search over the codebase that works even without exact keywords and respects .gitignore rules.",
             inputSchema={
                 "type": "object",
